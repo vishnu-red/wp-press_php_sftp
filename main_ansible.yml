@@ -1,0 +1,223 @@
+- name: Set up MariaDB, PHP, Nginx, and configure website
+  hosts: localhost
+  become: yes
+  tasks:
+    - name: Ensure /etc/yum.repos.d directory exists
+      file:
+        path: /etc/yum.repos.d
+        state: directory
+
+    - name: Create MariaDB repository file
+      copy:
+        dest: /etc/yum.repos.d/MariaDB.repo
+        content: |
+          [mariadb]
+          name = MariaDB
+          baseurl = http://yum.mariadb.org/10.6/rhel9-amd64
+          gpgkey = https://yum.mariadb.org/RPM-GPG-KEY-MariaDB
+          gpgcheck = 1
+
+    - name: Ensure required packages are installed
+      yum:
+        name:
+          - python3-pip
+          - php
+          - php-mysqlnd
+          - php-mysqli
+          - php-gd
+          - php-mbstring
+          - mariadb-server
+          - mariadb
+          - nginx
+        state: present
+
+    - name: Install passlib library
+      pip:
+        name: passlib
+        state: present
+
+    - name: Start and enable MariaDB and Nginx
+      systemd:
+        name: "{{ item }}"
+        enabled: yes
+        state: started
+      loop:
+        - mariadb
+        - nginx
+
+    - name: Create user vishnu
+      user:
+        name: vishnu
+        password: "{{ 'redhat' | password_hash('sha512') }}"
+        create_home: yes
+
+    - name: Create website directory for vishnu
+      file:
+        path: /home/vishnu/website/public
+        state: directory
+        owner: vishnu
+        group: vishnu
+        mode: '0755'
+
+    - name: Configure Nginx server block
+      copy:
+        dest: /etc/nginx/conf.d/mydata.conf
+        content: |
+          server {
+              listen 80;
+              listen [::]:80;
+              server_name _;
+
+              root /home/vishnu/website/public;
+
+              include /etc/nginx/default.d/*.conf;
+
+              error_page 404 /404.html;
+              location = /404.html {}
+
+              error_page 500 502 503 504 /50x.html;
+              location = /50x.html {}
+          }
+      notify: Restart Nginx
+
+    - name: Test and reload Nginx
+      command: nginx -t
+      register: nginx_test_result
+      failed_when: "'syntax is okay' not in nginx_test_result.stderr and 'test is successful' not in nginx_test_result.stderr"
+
+    - name: Set permissions for /home/vishnu
+      file:
+        path: /home/vishnu
+        mode: '0755'
+        recurse: yes
+
+    - name: Change ownership for website directory
+      file:
+        path: /home/vishnu/website
+        owner: nginx
+        group: nginx
+        recurse: yes
+
+    - name: Download and extract WordPress
+      block:
+        - name: Download WordPress latest.zip
+          get_url:
+            url: https://wordpress.org/latest.zip
+            dest: /home/vishnu/website/public/latest.zip
+
+        - name: Unzip WordPress
+          unarchive:
+            src: /home/vishnu/website/public/latest.zip
+            dest: /home/vishnu/website/public/
+            remote_src: yes
+
+        - name: Remove downloaded WordPress zip file
+          file:
+            path: /home/vishnu/website/public/latest.zip
+            state: absent
+
+    - name: Set permissions for WordPress wp-content
+      file:
+        path: /home/vishnu/website/public/wordpress/wp-content
+        mode: '0755'
+        recurse: yes
+
+    - name: Change ownership of wp-content directory
+      file:
+        path: /home/vishnu/website/public/wordpress/wp-content
+        owner: nginx
+        group: nginx
+        recurse: yes
+
+    - name: Secure MariaDB installation
+      block:
+        - name: Check if MariaDB root password is set
+          command: mysqladmin -u root status
+          register: mariadb_root_check
+          failed_when: false
+          changed_when: false
+
+        - name: Secure MariaDB setup
+          shell: |
+            mysql --user=root <<EOF
+            ALTER USER 'root'@'localhost' IDENTIFIED BY 'redhat';
+            DELETE FROM mysql.user WHERE User='';
+            DROP DATABASE IF EXISTS test;
+            DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+            FLUSH PRIVILEGES;
+            EOF
+          args:
+            executable: /bin/bash
+          when: "'Access denied' not in mariadb_root_check.stderr"
+
+    - name: Create database and user in MariaDB
+      shell: |
+        mysql --user=root --password=redhat <<EOF
+        CREATE DATABASE vishnu_DB;
+        CREATE USER 'vishnu'@'localhost' IDENTIFIED BY 'redhat';
+        GRANT ALL PRIVILEGES ON vishnu_DB.* TO 'vishnu'@'localhost';
+        FLUSH PRIVILEGES;
+        EOF
+      args:
+        executable: /bin/bash
+      register: db_creation_result
+      failed_when: db_creation_result.rc != 0 and "exists" not in db_creation_result.stderr
+      changed_when: "'CREATE DATABASE' in db_creation_result.stdout or 'GRANT' in db_creation_result.stdout"
+
+    - name: Copy wp-config.php
+      template:
+        src: /root/ansible-project.git/wp-config.php.j2
+        dest: /home/vishnu/website/public/wordpress/wp-config.php
+
+    - name: Download and setup phpMyAdmin
+      block:
+        - name: Download phpMyAdmin zip
+          get_url:
+            url: https://files.phpmyadmin.net/phpMyAdmin/5.2.1/phpMyAdmin-5.2.1-all-languages.zip
+            dest: /home/vishnu/website/public/phpMyAdmin.zip
+
+        - name: Unzip phpMyAdmin
+          unarchive:
+            src: /home/vishnu/website/public/phpMyAdmin.zip
+            dest: /home/vishnu/website/public/
+            remote_src: yes
+
+        - name: Rename phpMyAdmin directory
+          command: mv /home/vishnu/website/public/phpMyAdmin-5.2.1-all-languages /home/vishnu/website/public/phpMyAdmin
+
+        - name: Remove phpMyAdmin zip file
+          file:
+            path: /home/vishnu/website/public/phpMyAdmin.zip
+            state: absent
+
+    - name: Install Certbot and configure SSL
+      block:
+        - name: Install Certbot and Nginx plugin
+          yum:
+            name:
+              - certbot
+              - python3-certbot-nginx
+            state: present
+
+        - name: Obtain SSL certificate
+          command: certbot --nginx -d vizhnu.rageshvk.site --non-interactive --agree-tos --email vishnumahesh166@gmail.com
+          register: certbot_result
+          failed_when: certbot_result.rc != 0
+          changed_when: "'Congratulations' in certbot_result.stdout or 'Certbot' in certbot_result.stderr"
+
+        - name: Reload Nginx after SSL setup
+          systemd:
+            name: nginx
+            state: reloaded
+
+  handlers:
+    - name: Restart Nginx
+      systemd:
+        name: nginx
+        state: restarted
+
+    - name: Restart SSH service
+      systemd:
+        name: sshd
+        state: restarted
+
